@@ -33,11 +33,14 @@ jobs:
         python3 -m pip install --upgrade pip setuptools wheel
         python3 -m pip install -r requirements.txt
 
+    - name: Test API response handling
+      run: python3 -m unittest discover -s tests -v
+
     # Generate all statistics images
     - name: Generate images
       run: |
         python3 --version
-        python3 generate_images.py
+        python3 -u generate_images.py
       env:
         ACCESS_TOKEN: ${{ secrets.ACCESS_TOKEN }}
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

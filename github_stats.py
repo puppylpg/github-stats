@@ -2,7 +2,7 @@
 
 import asyncio
 import os
-from typing import Dict, List, Optional, Set, Tuple, Any, cast
+from typing import Dict, List, Optional, Set, Tuple, Any, Union, cast
 
 import aiohttp
 import requests
@@ -30,6 +30,8 @@ class Queries(object):
         self.access_token = access_token
         self.session = session
         self.semaphore = asyncio.Semaphore(max_connections)
+        # Only names explicitly identified as public may appear in Actions logs.
+        self.public_repos: Set[str] = set()
 
     async def query(self, generated_query: str) -> Dict:
         """
@@ -65,7 +67,9 @@ class Queries(object):
                     return result
         return dict()
 
-    async def query_rest(self, path: str, params: Optional[Dict] = None) -> Dict:
+    async def query_rest(
+        self, path: str, params: Optional[Dict] = None
+    ) -> Union[Dict, List]:
         """
         Make a request to the REST API
         :param path: API path to query
@@ -73,48 +77,68 @@ class Queries(object):
         :return: deserialized REST JSON output
         """
 
-        for _ in range(60):
-            headers = {
-                "Authorization": f"token {self.access_token}",
-            }
-            if params is None:
-                params = dict()
-            if path.startswith("/"):
-                path = path[1:]
+        path = path.lstrip("/")
+        params = {} if params is None else params
+        headers = {"Authorization": f"token {self.access_token}"}
+        parts = path.split("/")
+        repo = "/".join(parts[1:3]) if parts[0] == "repos" else ""
+        endpoint = "/".join(parts[3:]) if repo else "request"
+        repo_label = repo if repo in self.public_repos else "private repository"
+        label = f"{endpoint} for {repo_label}"
+
+        for attempt in range(60):
             try:
                 async with self.semaphore:
                     r_async = await self.session.get(
                         f"https://api.github.com/{path}",
                         headers=headers,
                         params=tuple(params.items()),
+                        timeout=aiohttp.ClientTimeout(total=30),
                     )
-                if r_async.status == 202:
-                    # print(f"{path} returned 202. Retrying...")
-                    print(f"A path returned 202. Retrying...")
-                    await asyncio.sleep(2)
-                    continue
-
-                result = await r_async.json()
-                if result is not None:
-                    return result
-            except:
-                print("aiohttp failed for rest query")
-                # Fall back on non-async requests
+                    try:
+                        status = r_async.status
+                        if status == 200:
+                            return await r_async.json()
+                    finally:
+                        r_async.release()
+            except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+                # Do not log exception text: it may include private repo URLs.
+                print(f"Async {label} failed; trying the requests fallback.")
                 async with self.semaphore:
-                    r_requests = requests.get(
-                        f"https://api.github.com/{path}",
-                        headers=headers,
-                        params=tuple(params.items()),
-                    )
-                    if r_requests.status_code == 202:
-                        print(f"A path returned 202. Retrying...")
-                        await asyncio.sleep(2)
-                        continue
-                    elif r_requests.status_code == 200:
-                        return r_requests.json()
-        # print(f"There were too many 202s. Data for {path} will be incomplete.")
-        print("There were too many 202s. Data for this repository will be incomplete.")
-        return dict()
+                    try:
+                        r_requests = await asyncio.to_thread(
+                            requests.get,
+                            f"https://api.github.com/{path}",
+                            headers=headers,
+                            params=tuple(params.items()),
+                            timeout=30,
+                        )
+                        status = r_requests.status_code
+                        if status == 200:
+                            return r_requests.json()
+                    except (requests.RequestException, ValueError):
+                        print(f"Request for {label} failed; data will be incomplete.")
+                        return {}
+
+            # A 204 is a terminal empty result, with no JSON body to parse.
+            if status == 204:
+                print(f"No data available for {label} (HTTP 204).")
+                return [] if endpoint == "stats/contributors" else {}
+            if status != 202:
+                print(
+                    f"Request for {label} returned HTTP {status}; "
+                    "data will be incomplete."
+                )
+                return {}
+            if attempt < 59:
+                print(f"Statistics for {label} are being generated (HTTP 202); retrying.")
+                await asyncio.sleep(2)
+
+        print(
+            f"Statistics for {label} still returned HTTP 202 after 60 attempts; "
+            "data will be incomplete."
+        )
+        return {}
 
     @staticmethod
     def repos_overview(
@@ -142,6 +166,7 @@ class Queries(object):
       }}
       nodes {{
         nameWithOwner
+        isPrivate
         stargazers {{
           totalCount
         }}
@@ -178,6 +203,7 @@ class Queries(object):
       }}
       nodes {{
         nameWithOwner
+        isPrivate
         stargazers {{
           totalCount
         }}
@@ -343,6 +369,8 @@ Languages:
                 name = repo.get("nameWithOwner")
                 if name in self._repos or name in self._exclude_repos:
                     continue
+                if repo.get("isPrivate") is False:
+                    self.queries.public_repos.add(name)
                 self._repos.add(name)
                 self._stargazers += repo.get("stargazers").get("totalCount", 0)
                 self._forks += repo.get("forkCount", 0)
